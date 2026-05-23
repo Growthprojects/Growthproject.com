@@ -14,13 +14,24 @@
   ║  ALTER TABLE history                                             ║
   ║    ADD COLUMN IF NOT EXISTS amount numeric DEFAULT 0;           ║
   ║                                                                  ║
-  ║  STEP 2 ⚡ THE REAL REASON HISTORY IS BLANK:                    ║
+  ║  STEP 2 — Add the yield-date tracker column (NEW — index9):     ║
+  ║                                                                  ║
+  ║  -- Tracks the last calendar day each investor received a yield ║
+  ║  -- dividend.  NULL = never paid.                               ║
+  ║  -- Used by distributeGlobalInterest() as the per-user          ║
+  ║  -- double-pay guard, AND stamped by processDeposit() on        ║
+  ║  -- approval so same-day approvals are deferred to tomorrow.    ║
+  ║                                                                  ║
+  ║  ALTER TABLE profiles                                            ║
+  ║    ADD COLUMN IF NOT EXISTS last_yield_date date;               ║
+  ║                                                                  ║
+  ║  STEP 3 ⚡ THE REAL REASON HISTORY IS BLANK:                    ║
   ║  Your history table has RLS ENABLED but ZERO policies.          ║
   ║  Supabase silently blocks every single insert. Run this:        ║
   ║                                                                  ║
   ║  ALTER TABLE public.history DISABLE ROW LEVEL SECURITY;         ║
   ║                                                                  ║
-  ║  STEP 3 — Reload schema cache:                                  ║
+  ║  STEP 4 — Reload schema cache:                                  ║
   ║  Supabase → Settings → API → click Reload schema cache          ║
   ╚══════════════════════════════════════════════════════════════════╝
 -->
@@ -2102,7 +2113,10 @@
             <div class="referral-card">
                 <div class="referral-label">Your Referral Code</div>
                 <div class="referral-code" id="userReferralCode">LOADING…</div>
-                <button class="copy-btn" onclick="copyReferralCode()">📋 Copy Code</button>
+                <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:2px;">
+                    <button class="copy-btn" onclick="copyReferralCode()">📋 Copy Code</button>
+                    <button class="copy-btn" onclick="copyReferralLink()" style="background:var(--green);color:var(--white);">🔗 Copy Referral Link</button>
+                </div>
             </div>
         </div>
     </div><!-- /#referralPage -->
@@ -3095,14 +3109,42 @@
     // REFERRAL
     // ═══════════════════════════════════════════════════
     function copyReferralCode() {
-        const code = document.getElementById('userReferralCode').textContent;
-        const el = document.createElement('textarea');
-        el.value = code;
-        document.body.appendChild(el);
-        el.select();
-        document.execCommand('copy');
-        document.body.removeChild(el);
-        showToast('Referral code copied!');
+        const code = document.getElementById('userReferralCode').textContent.trim();
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(code).then(() => showToast('📋 Referral code copied!'));
+        } else {
+            const el = document.createElement('textarea');
+            el.value = code;
+            document.body.appendChild(el);
+            el.select();
+            document.execCommand('copy');
+            document.body.removeChild(el);
+            showToast('📋 Referral code copied!');
+        }
+    }
+
+    function copyReferralLink() {
+        const code = document.getElementById('userReferralCode').textContent.trim();
+        if (!code || code === 'LOADING…') {
+            showToast('Referral code not ready yet. Please wait.');
+            return;
+        }
+        // Always use the live GitHub Pages URL — never window.location.href,
+        // which would produce a local file:// path when testing offline.
+        const referralLink = 'https://growthprojects.github.io/Growthproject.com/?ref=' + encodeURIComponent(code);
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(referralLink).then(() => {
+                showToast('🔗 Referral link copied! Share it with your friends.');
+            });
+        } else {
+            const el = document.createElement('textarea');
+            el.value = referralLink;
+            document.body.appendChild(el);
+            el.select();
+            document.execCommand('copy');
+            document.body.removeChild(el);
+            showToast('🔗 Referral link copied! Share it with your friends.');
+        }
     }
 
     // ═══════════════════════════════════════════════════
@@ -3115,11 +3157,33 @@
         }
         showView('adminPage');
 
-        // Show/hide the "not distributed today" warning banner
-        const todayStr = new Date().toISOString().slice(0, 10);
-        const lastDist = localStorage.getItem('lastDistributionDate');
-        const banner   = document.getElementById('distWarningBanner');
-        if (banner) banner.style.display = (lastDist !== todayStr) ? 'block' : 'none';
+        // ── DB-BACKED BANNER CHECK ──────────────────────────────────────────────
+        // Query the database directly — no localStorage, works across all browsers
+        // and devices. Shows banner only if eligible investors haven't been paid today.
+        //
+        // An investor is "eligible but unpaid today" when:
+        //   locked_capital > 0  AND  (last_yield_date IS NULL  OR  last_yield_date < today)
+        //
+        // Investors approved today have last_yield_date = today (stamped by processDeposit),
+        // so they are correctly excluded from this count and will never cause a false alarm.
+        // ───────────────────────────────────────────────────────────────────────
+        const banner = document.getElementById('distWarningBanner');
+        if (banner) {
+            try {
+                const todayStr = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+
+                const { count, error: cntErr } = await supabase
+                    .from('profiles')
+                    .select('id', { count: 'exact', head: true })
+                    .gt('locked_capital', 0)
+                    .or(`last_yield_date.is.null,last_yield_date.lt.${todayStr}`);
+
+                // Show warning if at least one investor is still awaiting today's payout
+                banner.style.display = (!cntErr && count > 0) ? 'block' : 'none';
+            } catch (_) {
+                banner.style.display = 'none';
+            }
+        }
 
         await loadPendingRequests();
     }
@@ -3340,11 +3404,17 @@
                 if (uErr) throw uErr;
 
                 // ── CORE CHANGE: Approved deposit locks capital, does NOT increase balance ──
+                // Stamp last_yield_date = today so this investor is skipped by today's
+                // distribution cycle and deferred to tomorrow (midnight boundary rule).
                 const newLockedCapital = parseFloat(u.locked_capital || 0) + parseFloat(amount);
+                const approvalDateISO  = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 
                 const { error: upErr } = await supabase
                     .from('profiles')
-                    .update({ locked_capital: newLockedCapital })
+                    .update({
+                        locked_capital:  newLockedCapital,
+                        last_yield_date: approvalDateISO   // ← defers to tomorrow's cycle
+                    })
                     .eq('id', userId);
                 if (upErr) throw upErr;
 
@@ -3457,6 +3527,26 @@
     // ═══════════════════════════════════════════════════
     // ADMIN: DISTRIBUTE GLOBAL DAILY INTEREST
     // ═══════════════════════════════════════════════════
+    //
+    // GUARD ARCHITECTURE (three layers, all database-backed):
+    //
+    //   Layer 1 — ZERO-CAPITAL FILTER
+    //     The query only pulls profiles where locked_capital > 0.
+    //     New accounts with no approved deposit are invisible to this query.
+    //
+    //   Layer 2 — SAME-DAY IDEMPOTENCY (replaces localStorage)
+    //     The query additionally requires last_yield_date IS NULL OR < today.
+    //     Once a user is paid, last_yield_date is stamped to today in the same
+    //     DB update, so clicking the button a second time simply finds 0 rows.
+    //     This guard works across every browser and device — no localStorage.
+    //
+    //   Layer 3 — TODAY'S-APPROVAL DEFERRAL (12:00 AM midnight boundary)
+    //     processDeposit() stamps last_yield_date = today when approving a deposit.
+    //     These users therefore have last_yield_date = today before distribution
+    //     runs, so they naturally fall outside the query and are deferred to the
+    //     next 12:00 AM cycle. They are counted and reported as "deferred".
+    //
+    // ═══════════════════════════════════════════════════
     async function distributeGlobalInterest() {
         const btn      = document.querySelector('.btn-distribute');
         const progress = document.getElementById('distProgress');
@@ -3470,73 +3560,93 @@
             return;
         }
 
-        btn.disabled = true;
+        btn.disabled    = true;
         btn.style.opacity = '0.7';
         progress.classList.add('visible');
-        progress.textContent = '⏳ Checking distribution history…';
+        progress.textContent = '⏳ Checking distribution status…';
+
+        // Use sv-SE locale's date split for guaranteed YYYY-MM-DD regardless of timezone edge cases
+        const todayStr = new Date().toLocaleDateString('sv-SE'); // e.g. "2025-05-20"
 
         try {
-            // ── SAME-DAY GUARD: prevent distributing more than once per calendar day ──
-            const todayStr = new Date().toISOString().slice(0, 10); // e.g. "2025-05-18"
-            const lastDist = localStorage.getItem('lastDistributionDate');
-            if (lastDist === todayStr) {
-                progress.textContent = '⚠️ Daily interest was already distributed today (' + todayStr + '). Come back tomorrow!';
-                btn.disabled = false;
-                btn.style.opacity = '1';
-                return;
-            }
+            // ── PRE-FLIGHT: count investors already stamped today (newly approved = deferred) ──
+            const { count: alreadyStampedCount, error: preErr } = await supabase
+                .from('profiles')
+                .select('id', { count: 'exact', head: true })
+                .gt('locked_capital', 0)
+                .eq('last_yield_date', todayStr);
 
-            progress.textContent = '⏳ Fetching active investors…';
+            if (preErr) throw preErr;
 
-            // Fetch all profiles with locked_capital > 0
+            // ── FETCH ELIGIBLE INVESTORS ──
+            // Only profiles with locked_capital > 0 that have NOT been paid today.
+            // This includes: (a) never paid (NULL), (b) last paid on a previous day.
+            // It EXCLUDES: investors whose deposit was approved today (deferred to tomorrow).
+            progress.textContent = '⏳ Fetching eligible investors…';
+
             const { data: investors, error: fetchErr } = await supabase
                 .from('profiles')
-                .select('id, phone, balance, total_income, locked_capital')
-                .gt('locked_capital', 0);
+                .select('id, phone, balance, total_income, locked_capital, last_yield_date')
+                .gt('locked_capital', 0)
+                .or(`last_yield_date.is.null,last_yield_date.lt.${todayStr}`);
 
             if (fetchErr) throw fetchErr;
 
+            // ── ALREADY DONE TODAY CHECK ──
             if (!investors || investors.length === 0) {
-                progress.textContent = '⚠️ No active investors found with locked capital.';
-                btn.disabled = false;
+                const deferredNote = (alreadyStampedCount > 0)
+                    ? ` (${alreadyStampedCount} investor${alreadyStampedCount > 1 ? 's' : ''} approved today deferred to tomorrow's cycle.)`
+                    : '';
+
+                progress.textContent =
+                    '✅ Today\'s distribution (' + todayStr + ') is already complete — all eligible investors have been paid.' + deferredNote;
+
+                // Hide the warning banner — distribution is done for today
+                const distBanner = document.getElementById('distWarningBanner');
+                if (distBanner) distBanner.style.display = 'none';
+
+                btn.disabled    = false;
                 btn.style.opacity = '1';
                 return;
             }
 
-            progress.textContent = `⏳ Processing ${investors.length} investor(s)…`;
+            progress.textContent = `⏳ Processing ${investors.length} eligible investor(s)…`;
 
             let successCount = 0;
             let skippedCount = 0;
-            const now = new Date().toISOString();
 
             for (const user of investors) {
                 const tier = getTierByLockedCapital(user.locked_capital);
 
                 if (!tier) {
+                    // locked_capital doesn't map to any configured tier — skip safely
                     skippedCount++;
                     continue;
                 }
 
-                const dailyYield    = tier.dailyInterest;
-                const newBalance    = parseFloat(user.balance || 0) + dailyYield;
+                const dailyYield     = tier.dailyInterest;
+                const newBalance     = parseFloat(user.balance     || 0) + dailyYield;
                 const newTotalIncome = parseFloat(user.total_income || 0) + dailyYield;
 
-                // Update the user's balance and total_income
+                // Update balance, total_income, AND last_yield_date atomically.
+                // Setting last_yield_date = todayStr is what makes this idempotent:
+                // if the button is clicked again today this user will not appear in the query.
                 const { error: updateErr } = await supabase
                     .from('profiles')
                     .update({
-                        balance:      newBalance,
-                        total_income: newTotalIncome
+                        balance:         newBalance,
+                        total_income:    newTotalIncome,
+                        last_yield_date: todayStr        // ← idempotency stamp
                     })
                     .eq('id', user.id);
 
                 if (updateErr) {
-                    console.warn('Failed to update user', user.id, updateErr.message);
+                    console.warn('Failed to update user', user.id, ':', updateErr.message);
                     skippedCount++;
                     continue;
                 }
 
-                // Insert ledger history record — only confirmed schema columns
+                // Ledger entry
                 const { error: histErr } = await supabase.from('history').insert([{
                     user_id:     user.id,
                     amount:      dailyYield,
@@ -3550,14 +3660,21 @@
                 successCount++;
             }
 
-            progress.textContent =
-                `✅ Distribution complete! ${successCount} investor(s) credited.` +
-                (skippedCount > 0 ? ` (${skippedCount} skipped — no matching tier)` : '');
+            // ── FINAL REPORT ──
+            const deferredTotal = (alreadyStampedCount || 0);
+            let resultMsg = `✅ Distribution complete for ${todayStr}! ` +
+                `${successCount} investor${successCount !== 1 ? 's' : ''} credited.`;
 
-            // Save today's date so the button is blocked for the rest of the day
-            const distDate = new Date().toISOString().slice(0, 10);
-            localStorage.setItem('lastDistributionDate', distDate);
-            // Hide the warning banner
+            if (skippedCount > 0) {
+                resultMsg += ` ${skippedCount} skipped (no matching tier config).`;
+            }
+            if (deferredTotal > 0) {
+                resultMsg += ` ${deferredTotal} new signup${deferredTotal !== 1 ? 's' : ''} safely deferred — will enter the cycle from tomorrow.`;
+            }
+
+            progress.textContent = resultMsg;
+
+            // Hide the warning banner — distribution is now complete for today
             const distBanner = document.getElementById('distWarningBanner');
             if (distBanner) distBanner.style.display = 'none';
 
@@ -3567,7 +3684,7 @@
             progress.textContent = '❌ Error: ' + err.message;
             showToast('Distribution failed: ' + err.message);
         } finally {
-            btn.disabled = false;
+            btn.disabled      = false;
             btn.style.opacity = '1';
         }
     }
@@ -3576,6 +3693,20 @@
     // BOOT — restore session / remember-me
     // ═══════════════════════════════════════════════════
     window.addEventListener('DOMContentLoaded', () => {
+        // ── AUTO-FILL REFERRAL CODE FROM URL (?ref=XXXX) ──
+        // When a user clicks a referral link like ?ref=08012345678,
+        // this block detects the parameter and pre-fills the sign-up form field.
+        const urlParams = new URLSearchParams(window.location.search);
+        const refCode = urlParams.get('ref');
+        if (refCode) {
+            const refInput = document.getElementById('signupReferral');
+            if (refInput) {
+                refInput.value = decodeURIComponent(refCode);
+            }
+            // Auto-switch to the Sign Up tab so the user lands on the right form
+            switchTab('signup');
+        }
+
         const remembered = localStorage.getItem('rememberpassword');
         if (remembered === '1') {
             const mob  = localStorage.getItem('moblie');
