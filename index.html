@@ -3129,9 +3129,9 @@
             showToast('Referral code not ready yet. Please wait.');
             return;
         }
-        // Always use the live GitHub Pages URL — never window.location.href,
-        // which would produce a local file:// path when testing offline.
-        const referralLink = 'https://growthprojects.github.io/Growthproject.com/?ref=' + encodeURIComponent(code);
+        // Build full URL: current page (strip any existing ?ref= query) + ?ref=CODE
+        const baseUrl = window.location.href.split('?')[0];
+        const referralLink = baseUrl + '?ref=' + encodeURIComponent(code);
         if (navigator.clipboard && navigator.clipboard.writeText) {
             navigator.clipboard.writeText(referralLink).then(() => {
                 showToast('🔗 Referral link copied! Share it with your friends.');
@@ -3694,8 +3694,11 @@
     // ═══════════════════════════════════════════════════
     window.addEventListener('DOMContentLoaded', () => {
         // ── AUTO-FILL REFERRAL CODE FROM URL (?ref=XXXX) ──
-        // When a user clicks a referral link like ?ref=08012345678,
-        // this block detects the parameter and pre-fills the sign-up form field.
+        // When a user arrives via a referral link (e.g. ?ref=08012345678):
+        //   1. Pre-fill the Sign Up form's referral input with the code.
+        //   2. Switch the visible tab to "Sign Up" so the code is immediately visible.
+        //   3. Return early — skip remember-me and cached-session restore entirely,
+        //      so an existing local session never silently hijacks a fresh invite.
         const urlParams = new URLSearchParams(window.location.search);
         const refCode = urlParams.get('ref');
         if (refCode) {
@@ -3703,10 +3706,11 @@
             if (refInput) {
                 refInput.value = decodeURIComponent(refCode);
             }
-            // Auto-switch to the Sign Up tab so the user lands on the right form
             switchTab('signup');
+            return; // ← skip session restore for referral visitors
         }
 
+        // ── REMEMBER-ME: restore saved credentials (login form only) ──
         const remembered = localStorage.getItem('rememberpassword');
         if (remembered === '1') {
             const mob  = localStorage.getItem('moblie');
@@ -3716,6 +3720,7 @@
             document.getElementById('rememberpassword').checked = true;
         }
 
+        // ── CACHED SESSION: auto-login returning user ──
         const cached = localStorage.getItem('currentUser');
         if (cached) {
             try {
